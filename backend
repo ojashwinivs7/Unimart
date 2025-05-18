@@ -2353,3 +2353,212 @@ struct RegisterRequest: Content, Validatable {
         validations.add("institutionName", as: String.self, is: !.empty)
     }
 }
+
+import Vapor
+import Fluent
+
+// MARK: - Rate Limiting Middleware
+
+struct RateLimitMiddleware: AsyncMiddleware {
+    let requestsPerMinute: Int
+    let duration: TimeInterval
+    
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+        let ip = request.remoteAddress?.ipAddress ?? "unknown"
+        let key = "rate_limit:\(ip)"
+        
+        // Get current request count
+        let currentCount = try await request.redis.get(key, as: Int.self) ?? 0
+        
+        if currentCount >= requestsPerMinute {
+            throw Abort(.tooManyRequests, reason: "Rate limit exceeded. Please try again later.")
+        }
+        
+        // Increment counter
+        try await request.redis.increment(key)
+        
+        // Set expiry if first request
+        if currentCount == 0 {
+            try await request.redis.expire(key, after: duration)
+        }
+        
+        return try await next.respond(to: request)
+    }
+}
+
+// MARK: - Input Sanitization Middleware
+
+struct InputSanitizationMiddleware: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+        // Sanitize query parameters
+        for (key, value) in request.query {
+            if let stringValue = value as? String {
+                request.query[key] = sanitizeInput(stringValue)
+            }
+        }
+        
+        // Sanitize body if JSON
+        if request.headers.contentType == .json,
+           let body = request.body.data,
+           let json = try? JSONSerialization.jsonObject(with: body, options: .mutableContainers) as? [String: Any] {
+            let sanitizedJson = sanitizeDictionary(json)
+            request.body = try Body(data: JSONSerialization.data(withJSONObject: sanitizedJson))
+        }
+        
+        return try await next.respond(to: request)
+    }
+    
+    private func sanitizeInput(_ input: String) -> String {
+        // Remove HTML tags and potentially dangerous characters
+        let dangerousCharacters = ["<", ">", "&", "\"", "'"]
+        var sanitized = input
+        for char in dangerousCharacters {
+            sanitized = sanitized.replacingOccurrences(of: char, with: "")
+        }
+        return sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    private func sanitizeDictionary(_ dict: [String: Any]) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for (key, value) in dict {
+            if let stringValue = value as? String {
+                result[key] = sanitizeInput(stringValue)
+            } else if let nestedDict = value as? [String: Any] {
+                result[key] = sanitizeDictionary(nestedDict)
+            } else if let array = value as? [Any] {
+                result[key] = array.map { item in
+                    if let str = item as? String {
+                        return sanitizeInput(str)
+                    } else if let dict = item as? [String: Any] {
+                        return sanitizeDictionary(dict)
+                    }
+                    return item
+                }
+            } else {
+                result[key] = value
+            }
+        }
+        return result
+    }
+}
+
+// MARK: - Configuration Updates
+
+extension StudentMarketApp {
+    static func configureMiddleware(_ app: Application) {
+        // Existing middleware...
+        
+        // Add rate limiting
+        app.middleware.use(RateLimitMiddleware(requestsPerMinute: 100, duration: 60))
+        
+        // Add input sanitization
+        app.middleware.use(InputSanitizationMiddleware())
+        
+        // Add security headers
+        app.middleware.use(SecurityHeadersMiddleware())
+    }
+}
+
+// MARK: - Security Headers Middleware
+
+struct SecurityHeadersMiddleware: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+        let response = try await next.respond(to: request)
+        
+        // Add security headers
+        response.headers.replaceOrAdd(name: "X-Content-Type-Options", value: "nosniff")
+        response.headers.replaceOrAdd(name: "X-Frame-Options", value: "DENY")
+        response.headers.replaceOrAdd(name: "X-XSS-Protection", value: "1; mode=block")
+        response.headers.replaceOrAdd(name: "Content-Security-Policy", value: "default-src 'self'")
+        response.headers.replaceOrAdd(name: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains")
+        
+        return response
+    }
+}
+
+// MARK: - Redis Configuration
+
+extension StudentMarketApp {
+    static func configureRedis(_ app: Application) throws {
+        guard let redisURL = Environment.get("REDIS_URL") else {
+            throw Abort(.internalServerError, reason: "Redis URL not configured")
+        }
+        
+        app.redis.configuration = try RedisConfiguration(url: redisURL)
+    }
+}
+
+// MARK: - Updated Application Setup
+
+extension StudentMarketApp {
+    static func main() async throws {
+        var env = try Environment.detect()
+        try LoggingSystem.bootstrap(from: &env)
+        
+        let app = Application(env)
+        defer { app.shutdown() }
+        
+        // Configure database
+        try configureDatabase(app)
+        
+        // Configure Redis
+        try configureRedis(app)
+        
+        // Configure JWT
+        try configureJWT(app)
+        
+        // Configure middleware
+        configureMiddleware(app)
+        
+        // Configure routes
+        try configureRoutes(app)
+        
+        try app.run()
+    }
+}
+
+// MARK: - Updated Migrations
+
+extension StudentMarketApp {
+    static func runMigrations(_ app: Application) throws {
+        // Existing migrations...
+        
+        // Add index for performance
+        app.migrations.add(CreateItemIndexes())
+        app.migrations.add(CreateTransactionIndexes())
+    }
+}
+
+// MARK: - Performance Indexes
+
+struct CreateItemIndexes: Migration {
+    func prepare(on database: Database) -> EventLoopFuture<Void> {
+        database.schema(Item.schema)
+            .index([Item.FieldKeys.userId, Item.FieldKeys.status, Item.FieldKeys.createdAt])
+            .index([Item.FieldKeys.categoryId, Item.FieldKeys.status])
+            .update()
+    }
+    
+    func revert(on database: Database) -> EventLoopFuture<Void> {
+        database.schema(Item.schema)
+            .deleteIndex([Item.FieldKeys.userId, Item.FieldKeys.status, Item.FieldKeys.createdAt])
+            .deleteIndex([Item.FieldKeys.categoryId, Item.FieldKeys.status])
+            .update()
+    }
+}
+
+struct CreateTransactionIndexes: Migration {
+    func prepare(on database: Database) -> EventLoopFuture<Void> {
+        database.schema(Transaction.schema)
+            .index([Transaction.FieldKeys.sellerId, Transaction.FieldKeys.status])
+            .index([Transaction.FieldKeys.buyerId, Transaction.FieldKeys.status])
+            .update()
+    }
+    
+    func revert(on database: Database) -> EventLoopFuture<Void> {
+        database.schema(Transaction.schema)
+            .deleteIndex([Transaction.FieldKeys.sellerId, Transaction.FieldKeys.status])
+            .deleteIndex([Transaction.FieldKeys.buyerId, Transaction.FieldKeys.status])
+            .update()
+    }
+}
